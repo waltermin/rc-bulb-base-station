@@ -1,0 +1,10 @@
+# ESP32-WROOM-32: 4 MB flash.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Console REPL runs on the default UART; keep the standard 115200 baud.
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+
+# 1 kHz tick so the bench loop can yield in 1 ms steps (default 100 Hz / 10 ms
+# is far too coarse and would throttle the max-rate TX test).
+CONFIG_FREERTOS_HZ=1000

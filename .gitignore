@@ -1,0 +1,8 @@
+# ESP-IDF build output
+/build/
+sdkconfig
+sdkconfig.old
+
+# python
+__pycache__/
+*.pyc
