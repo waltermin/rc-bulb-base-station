@@ -6,15 +6,28 @@
 //
 // Commands (type `help`):
 //   set <id> <r> <g> <b> <ww> <cw>   add/update a bulb entry (values 0..255)
+//   scaledset <id> <r> <g> <b> <ww> <cw> <scale>
+//                                    PreciseLightUpdate: channels scaled by
+//                                    scale% and sent as floats (one bulb at a time)
 //   clr <id>                         remove one bulb entry
 //   clrall                           remove all entries
 //   dfu <id>                         request DFU mode for a bulb (burst)
+//   sweep <id> <channels> <ms>       linear 0->255->0 loop over the channels
+//   psweep <id> <channels> <ms> <min> <max>
+//                                    precise float sweep bouncing between
+//                                    min%..max% of full scale (one bulb at a time)
+//   stopsweep                        stop the active sweep(s)
 //   chan <1..13>                     set the broadcast channel
 //   interval <ms>                    set the beacon interval
 //   start | stop                     resume / pause broadcasting
 //   show                             print current state
 //
-// The bulb firmware expects channel 1 by default (WIFI_CHANNEL in its config.h).
+// Two packet types go on the wire (selected by the first payload byte, a packet
+// tag): 0x01 LightUpdate carries the u8 entry table; 0x02 PreciseLightUpdate
+// carries one bulb's float channels. When a precise target is active it is
+// broadcast as its own beacon each tick, alongside the LightUpdate beacon.
+//
+// The bulb firmware expects channel 11 by default (WIFI_CHANNEL in its config.h).
 
 #include <stdio.h>
 #include <string.h>
@@ -38,10 +51,19 @@ static const char *TAG = "base";
 #define OUI0 0x52
 #define OUI1 0x43
 #define OUI2 0x68
-#define PROTO_VERSION 0x01
+#define TAG_LIGHT_UPDATE 0x01           // packet tag: u8 entry table
+#define TAG_PRECISE_LIGHT_UPDATE 0x02   // packet tag: one bulb, f32 channels
 #define CTRL_FLAG_DFU 0x01
 #define MAX_ENTRIES 11
 #define ENTRY_SIZE 6
+#define PRECISE_BODY_SIZE (2 + 5 * 4)   // tag + bulb_id + 5 * f32
+
+// ---- color channel bits (for `sweep`) ---------------------------------------
+#define CH_R  0x01
+#define CH_G  0x02
+#define CH_B  0x04
+#define CH_WW 0x08
+#define CH_CW 0x10
 
 // ---- shared broadcast state -------------------------------------------------
 typedef struct {
@@ -50,10 +72,46 @@ typedef struct {
 } entry_t;
 
 static entry_t s_entries[MAX_ENTRIES];
+
+// One active linear triangle-wave sweep: 0 -> 255 -> 0 over `period_ms`, looping
+// until stopped. Applied to `mask`ed channels of bulb `id` each broadcast tick.
+typedef struct {
+    bool active;
+    uint8_t id;
+    uint8_t mask;        // OR of CH_* bits
+    int period_ms;       // full 0->255->0 cycle
+    int64_t start_us;    // esp_timer_get_time() when the sweep began
+} sweep_t;
+
+static sweep_t s_sweep;
+
+// The single active PreciseLightUpdate target (only one bulb can be precisely
+// controlled at a time — a new scaledset/psweep replaces the previous one).
+// When active, it is broadcast as its own 0x02 beacon each tick.
+typedef struct {
+    bool active;
+    uint8_t id;
+    float r, g, b, ww, cw;   // normalized [0,1]
+} precise_t;
+
+static precise_t s_precise;
+
+// Optional triangle-wave sweep driving the precise target's channels between
+// [min,max] (normalized). Writes into s_precise each broadcast tick.
+typedef struct {
+    bool active;
+    uint8_t mask;        // OR of CH_* bits
+    int period_ms;       // full min->max->min cycle
+    int64_t start_us;
+    float min, max;      // normalized [0,1], min <= max
+} psweep_t;
+
+static psweep_t s_psweep;
+
 static uint8_t s_control_flags = 0;
 static uint8_t s_control_data = 0;
 static int s_dfu_bursts_left = 0;   // while >0, keep control_flags=DFU then clear
-static int s_channel = 1;
+static int s_channel = 11;
 static int s_interval_ms = 200;
 static bool s_enabled = true;
 static uint8_t s_base_mac[6];
@@ -63,9 +121,9 @@ static SemaphoreHandle_t s_lock;
 #define UNLOCK() xSemaphoreGive(s_lock)
 
 // ---- beacon frame builder ---------------------------------------------------
-// Builds a complete 802.11 beacon (no FCS; hardware appends it) with our single
-// vendor IE. Caller must hold the lock. Returns frame length.
-static int build_beacon(uint8_t *p) {
+// Write the 36-byte 802.11 MAC header + beacon fixed params common to every
+// frame we send. Returns the offset just past them. Caller must hold the lock.
+static int write_beacon_header(uint8_t *p) {
     int n = 0;
 
     // MAC header (24 bytes)
@@ -80,11 +138,28 @@ static int build_beacon(uint8_t *p) {
     for (int i = 0; i < 8; i++) p[n++] = 0x00;    // timestamp
     p[n++] = 0x64; p[n++] = 0x00;                 // beacon interval (100 TU)
     p[n++] = 0x00; p[n++] = 0x00;                 // capability info
+    return n;
+}
 
-    // LightUpdatePacket body
+// Append our single vendor-specific IE (0xDD, OUI 52:43:68) carrying `body` at
+// offset `n`. `body` starts with the packet tag. Returns the new offset.
+static int write_vendor_ie(uint8_t *p, int n, const uint8_t *body, int blen) {
+    p[n++] = 0xDD;
+    p[n++] = (uint8_t)(3 + blen);                 // len = OUI + body
+    p[n++] = OUI0; p[n++] = OUI1; p[n++] = OUI2;
+    memcpy(p + n, body, blen); n += blen;
+    return n;
+}
+
+// Build a complete 0x01 LightUpdate beacon (no FCS; hardware appends it) with
+// our single vendor IE. Caller must hold the lock. Returns frame length.
+static int build_beacon(uint8_t *p) {
+    int n = write_beacon_header(p);
+
+    // LightUpdatePacket body (tag 0x01)
     uint8_t body[4 + MAX_ENTRIES * ENTRY_SIZE];
     int b = 0;
-    body[b++] = PROTO_VERSION;
+    body[b++] = TAG_LIGHT_UPDATE;
     body[b++] = s_control_flags;
     body[b++] = s_control_data;
     int count_idx = b++;                          // entry_count placeholder
@@ -101,25 +176,88 @@ static int build_beacon(uint8_t *p) {
     }
     body[count_idx] = (uint8_t)count;
 
-    // Vendor-specific IE (the ONLY IE)
-    p[n++] = 0xDD;
-    p[n++] = (uint8_t)(3 + b);                    // len = OUI + body
-    p[n++] = OUI0; p[n++] = OUI1; p[n++] = OUI2;
-    memcpy(p + n, body, b); n += b;
+    return write_vendor_ie(p, n, body, b);
+}
 
-    return n;
+// Build a complete 0x02 PreciseLightUpdate beacon for the active precise target.
+// Caller must hold the lock (and ensure s_precise.active). Returns frame length.
+static int build_precise_beacon(uint8_t *p) {
+    int n = write_beacon_header(p);
+
+    // PreciseLightUpdate body (tag 0x02): tag, bulb_id, 5 * f32 little-endian.
+    // The ESP32 is little-endian, so memcpy of each float yields the wire order.
+    uint8_t body[PRECISE_BODY_SIZE];
+    int b = 0;
+    body[b++] = TAG_PRECISE_LIGHT_UPDATE;
+    body[b++] = s_precise.id;
+    const float ch[5] = {s_precise.r, s_precise.g, s_precise.b,
+                         s_precise.ww, s_precise.cw};
+    for (int i = 0; i < 5; i++) { memcpy(body + b, &ch[i], 4); b += 4; }
+
+    return write_vendor_ie(p, n, body, b);
+}
+
+// ---- sweep -----------------------------------------------------------------
+// Return the index of the entry for `id`, or -1. Caller must hold the lock.
+static int find_entry(uint8_t id) {
+    for (int i = 0; i < MAX_ENTRIES; i++)
+        if (s_entries[i].used && s_entries[i].id == id) return i;
+    return -1;
+}
+
+// Write the current triangle-wave value into the swept channels of the target
+// bulb. Caller must hold the lock. If the entry vanished (cleared), stop.
+static void apply_sweep(void) {
+    int idx = find_entry(s_sweep.id);
+    if (idx < 0) { s_sweep.active = false; return; }
+
+    int64_t period = (int64_t)s_sweep.period_ms * 1000;   // us
+    int64_t half = period / 2;
+    int64_t phase = (esp_timer_get_time() - s_sweep.start_us) % period;
+    // Linear up for the first half, linear back down for the second.
+    int64_t v = (phase < half) ? (255 * phase) / half
+                               : (255 * (period - phase)) / half;
+    uint8_t val = (uint8_t)v;
+
+    entry_t *e = &s_entries[idx];
+    if (s_sweep.mask & CH_R)  e->r  = val;
+    if (s_sweep.mask & CH_G)  e->g  = val;
+    if (s_sweep.mask & CH_B)  e->b  = val;
+    if (s_sweep.mask & CH_WW) e->ww = val;
+    if (s_sweep.mask & CH_CW) e->cw = val;
+}
+
+// Write the current triangle-wave value into the swept channels of the precise
+// target, bouncing between s_psweep.min and .max. Caller holds the lock and has
+// ensured both s_precise.active and s_psweep.active.
+static void apply_psweep(void) {
+    int64_t period = (int64_t)s_psweep.period_ms * 1000;   // us
+    int64_t half = period / 2;
+    int64_t phase = (esp_timer_get_time() - s_psweep.start_us) % period;
+    // Triangle in [0,1]: linear up for the first half, back down for the second.
+    float tri = (phase < half) ? (float)phase / (float)half
+                               : (float)(period - phase) / (float)half;
+    float val = s_psweep.min + (s_psweep.max - s_psweep.min) * tri;
+
+    if (s_psweep.mask & CH_R)  s_precise.r  = val;
+    if (s_psweep.mask & CH_G)  s_precise.g  = val;
+    if (s_psweep.mask & CH_B)  s_precise.b  = val;
+    if (s_psweep.mask & CH_WW) s_precise.ww = val;
+    if (s_psweep.mask & CH_CW) s_precise.cw = val;
 }
 
 // ---- broadcast task ---------------------------------------------------------
 static void broadcast_task(void *arg) {
     (void)arg;
     static uint8_t frame[128];
+    static uint8_t pframe[128];
     int applied_channel = -1;
 
     for (;;) {
         int interval;
         bool enabled;
         int len = 0;
+        int plen = 0;
 
         LOCK();
         enabled = s_enabled;
@@ -129,6 +267,7 @@ static void broadcast_task(void *arg) {
             applied_channel = s_channel;
         }
         if (enabled) {
+            if (s_sweep.active) apply_sweep();
             len = build_beacon(frame);
             // DFU is a limited burst: count it down, then stop requesting it.
             if (s_control_flags == CTRL_FLAG_DFU && s_dfu_bursts_left > 0) {
@@ -137,6 +276,12 @@ static void broadcast_task(void *arg) {
                     s_control_data = 0;
                 }
             }
+            // A precise target rides along as its own separate beacon (a beacon
+            // may carry only our one vendor IE, so it cannot share the frame).
+            if (s_precise.active) {
+                if (s_psweep.active) apply_psweep();
+                plen = build_precise_beacon(pframe);
+            }
         }
         UNLOCK();
 
@@ -144,6 +289,12 @@ static void broadcast_task(void *arg) {
             esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
             if (e != ESP_OK) {
                 ESP_LOGW(TAG, "80211_tx failed: %s", esp_err_to_name(e));
+            }
+        }
+        if (enabled && plen > 0) {
+            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, pframe, plen, true);
+            if (e != ESP_OK) {
+                ESP_LOGW(TAG, "80211_tx (precise) failed: %s", esp_err_to_name(e));
             }
         }
         vTaskDelay(pdMS_TO_TICKS(interval));
@@ -156,6 +307,45 @@ static bool parse_u8(const char *s, uint8_t *out) {
     long v = strtol(s, &end, 0);
     if (*end != '\0' || v < 0 || v > 255) return false;
     *out = (uint8_t)v;
+    return true;
+}
+
+// Parse a 0..100 percentage (fractional allowed) into a normalized [0,1] frac.
+static bool parse_pct(const char *s, float *frac) {
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || v < 0.0 || v > 100.0) return false;
+    *frac = (float)(v / 100.0);
+    return true;
+}
+
+// Parse a channel value on set's 0..255 scale, but as a float (fractional
+// allowed) so PreciseLightUpdate keeps full precision.
+static bool parse_chanf(const char *s, float *out) {
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || *end != '\0' || v < 0.0 || v > 255.0) return false;
+    *out = (float)v;
+    return true;
+}
+
+// Parse a comma-separated channel list ("r,g,b" / "ww,cw" / "r,g,b,ww,cw")
+// into an OR of CH_* bits. Returns false on any unknown token.
+static bool parse_channel_mask(const char *s, uint8_t *out) {
+    char buf[32];
+    if (strlen(s) >= sizeof(buf)) return false;
+    strcpy(buf, s);
+    uint8_t mask = 0;
+    for (char *tok = strtok(buf, ","); tok; tok = strtok(NULL, ",")) {
+        if      (!strcmp(tok, "r"))  mask |= CH_R;
+        else if (!strcmp(tok, "g"))  mask |= CH_G;
+        else if (!strcmp(tok, "b"))  mask |= CH_B;
+        else if (!strcmp(tok, "ww")) mask |= CH_WW;
+        else if (!strcmp(tok, "cw")) mask |= CH_CW;
+        else return false;
+    }
+    if (mask == 0) return false;
+    *out = mask;
     return true;
 }
 
@@ -187,6 +377,39 @@ static int cmd_set(int argc, char **argv) {
                                 .b = v[3], .ww = v[4], .cw = v[5]};
     UNLOCK();
     printf("set bulb %d -> r%d g%d b%d ww%d cw%d\n", v[0], v[1], v[2], v[3], v[4], v[5]);
+    return 0;
+}
+
+static int cmd_scaledset(int argc, char **argv) {
+    if (argc != 8) {
+        printf("usage: scaledset <id> <r> <g> <b> <ww> <cw> <scale>\n");
+        printf("  channels 0..255 (fractional ok), scale 0..100%%; sends PreciseLightUpdate floats\n");
+        return 1;
+    }
+    uint8_t id;
+    float v[5];
+    if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
+    for (int i = 0; i < 5; i++) {
+        if (!parse_chanf(argv[i + 2], &v[i])) {
+            printf("bad value '%s' (0..255)\n", argv[i + 2]);
+            return 1;
+        }
+    }
+    float scale;
+    if (!parse_pct(argv[7], &scale)) { printf("bad scale '%s' (0..100)\n", argv[7]); return 1; }
+
+    // Everything stays in float: normalize each channel to [0,1], then apply the
+    // scale factor, so `scale` acts as a proportional dimmer on a 0..255 color.
+    float ch[5];
+    for (int i = 0; i < 5; i++) ch[i] = (v[i] / 255.0f) * scale;
+
+    LOCK();
+    s_psweep.active = false;   // a static precise set replaces any precise sweep
+    s_precise = (precise_t){.active = true, .id = id, .r = ch[0], .g = ch[1],
+                            .b = ch[2], .ww = ch[3], .cw = ch[4]};
+    UNLOCK();
+    printf("precise set bulb %d -> r%.3f g%.3f b%.3f ww%.3f cw%.3f (scale %s%%)\n",
+           id, ch[0], ch[1], ch[2], ch[3], ch[4], argv[7]);
     return 0;
 }
 
@@ -225,6 +448,89 @@ static int cmd_dfu(int argc, char **argv) {
     return 0;
 }
 
+static int cmd_sweep(int argc, char **argv) {
+    if (argc != 4) {
+        printf("usage: sweep <id> <channels> <duration_ms>\n");
+        printf("  channels: comma list of r,g,b,ww,cw  (e.g. r,g,b)\n");
+        return 1;
+    }
+    uint8_t id, mask;
+    if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
+    if (!parse_channel_mask(argv[2], &mask)) {
+        printf("bad channels '%s' (use r,g,b,ww,cw)\n", argv[2]);
+        return 1;
+    }
+    int ms = atoi(argv[3]);
+    if (ms < 100 || ms > 600000) {
+        printf("duration out of range (100..600000 ms)\n");
+        return 1;
+    }
+
+    LOCK();
+    // Ensure an entry exists for this bulb so the sweep has somewhere to write;
+    // channels not being swept keep whatever value they already hold.
+    int slot = find_entry(id);
+    if (slot < 0) {
+        for (int i = 0; i < MAX_ENTRIES; i++)
+            if (!s_entries[i].used) { slot = i; break; }
+        if (slot < 0) { UNLOCK(); printf("no free entry slots (max %d)\n", MAX_ENTRIES); return 1; }
+        s_entries[slot] = (entry_t){.used = true, .id = id};
+    }
+    s_sweep = (sweep_t){.active = true, .id = id, .mask = mask,
+                        .period_ms = ms, .start_us = esp_timer_get_time()};
+    UNLOCK();
+    printf("sweeping bulb %d channels %s over %d ms (0->255->0, looping)\n",
+           id, argv[2], ms);
+    return 0;
+}
+
+static int cmd_psweep(int argc, char **argv) {
+    if (argc != 6) {
+        printf("usage: psweep <id> <channels> <duration_ms> <min> <max>\n");
+        printf("  channels: comma list of r,g,b,ww,cw ; min/max are 0..100%% of full scale\n");
+        return 1;
+    }
+    uint8_t id, mask;
+    if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
+    if (!parse_channel_mask(argv[2], &mask)) {
+        printf("bad channels '%s' (use r,g,b,ww,cw)\n", argv[2]);
+        return 1;
+    }
+    int ms = atoi(argv[3]);
+    if (ms < 100 || ms > 600000) {
+        printf("duration out of range (100..600000 ms)\n");
+        return 1;
+    }
+    float mn, mx;
+    if (!parse_pct(argv[4], &mn)) { printf("bad min '%s' (0..100)\n", argv[4]); return 1; }
+    if (!parse_pct(argv[5], &mx)) { printf("bad max '%s' (0..100)\n", argv[5]); return 1; }
+    if (mn > mx) { printf("min must be <= max\n"); return 1; }
+
+    LOCK();
+    // Retarget the single precise slot if needed; a fresh target starts at 0 on
+    // the channels the sweep won't touch (mirrors how `sweep` seeds an entry).
+    if (!s_precise.active || s_precise.id != id) {
+        s_precise = (precise_t){.active = true, .id = id};
+    }
+    s_psweep = (psweep_t){.active = true, .mask = mask, .period_ms = ms,
+                          .start_us = esp_timer_get_time(), .min = mn, .max = mx};
+    UNLOCK();
+    printf("precise sweeping bulb %d channels %s over %d ms between %s%%..%s%% (looping)\n",
+           id, argv[2], ms, argv[4], argv[5]);
+    return 0;
+}
+
+static int cmd_stopsweep(int argc, char **argv) {
+    (void)argc; (void)argv;
+    LOCK();
+    bool was = s_sweep.active || s_psweep.active;
+    s_sweep.active = false;
+    s_psweep.active = false;   // precise target holds its last value, keeps broadcasting
+    UNLOCK();
+    printf(was ? "sweep(s) stopped\n" : "no active sweep\n");
+    return 0;
+}
+
 static int cmd_chan(int argc, char **argv) {
     if (argc != 2) { printf("usage: chan <1..13>\n"); return 1; }
     int ch = atoi(argv[1]);
@@ -237,7 +543,7 @@ static int cmd_chan(int argc, char **argv) {
 static int cmd_interval(int argc, char **argv) {
     if (argc != 2) { printf("usage: interval <ms>\n"); return 1; }
     int ms = atoi(argv[1]);
-    if (ms < 20 || ms > 10000) { printf("interval out of range (20..10000)\n"); return 1; }
+    if (ms < 5 || ms > 10000) { printf("interval out of range (5..10000)\n"); return 1; }
     LOCK(); s_interval_ms = ms; UNLOCK();
     printf("interval = %d ms\n", ms);
     return 0;
@@ -264,6 +570,23 @@ static int cmd_show(int argc, char **argv) {
            s_enabled ? "ON" : "OFF", s_channel, s_interval_ms, s_control_flags, s_control_data);
     printf("base MAC (frame src): %02x:%02x:%02x:%02x:%02x:%02x\n",
            s_base_mac[0], s_base_mac[1], s_base_mac[2], s_base_mac[3], s_base_mac[4], s_base_mac[5]);
+    if (s_sweep.active) {
+        printf("sweep: bulb %d  channels%s%s%s%s%s  period %d ms\n", s_sweep.id,
+               (s_sweep.mask & CH_R)  ? " r"  : "", (s_sweep.mask & CH_G)  ? " g"  : "",
+               (s_sweep.mask & CH_B)  ? " b"  : "", (s_sweep.mask & CH_WW) ? " ww" : "",
+               (s_sweep.mask & CH_CW) ? " cw" : "", s_sweep.period_ms);
+    }
+    if (s_precise.active) {
+        printf("precise: bulb %d  r%.3f g%.3f b%.3f ww%.3f cw%.3f\n", s_precise.id,
+               s_precise.r, s_precise.g, s_precise.b, s_precise.ww, s_precise.cw);
+        if (s_psweep.active) {
+            printf("psweep: channels%s%s%s%s%s  period %d ms  range %.0f%%..%.0f%%\n",
+                   (s_psweep.mask & CH_R)  ? " r"  : "", (s_psweep.mask & CH_G)  ? " g"  : "",
+                   (s_psweep.mask & CH_B)  ? " b"  : "", (s_psweep.mask & CH_WW) ? " ww" : "",
+                   (s_psweep.mask & CH_CW) ? " cw" : "", s_psweep.period_ms,
+                   s_psweep.min * 100.0f, s_psweep.max * 100.0f);
+        }
+    }
     int count = 0;
     for (int i = 0; i < MAX_ENTRIES; i++) {
         if (!s_entries[i].used) continue;
@@ -330,9 +653,13 @@ static void register_commands(void) {
     // that add fields (hint, argtable, func_w_context, ...) to esp_console_cmd_t.
     const esp_console_cmd_t cmds[] = {
         {.command = "set",      .help = "set <id> <r> <g> <b> <ww> <cw> : add/update a bulb entry", .func = &cmd_set},
+        {.command = "scaledset",.help = "scaledset <id> <r> <g> <b> <ww> <cw> <scale> : PreciseLightUpdate, channels scaled by scale%", .func = &cmd_scaledset},
         {.command = "clr",      .help = "clr <id> : remove one bulb entry", .func = &cmd_clr},
         {.command = "clrall",   .help = "remove all bulb entries", .func = &cmd_clrall},
         {.command = "dfu",      .help = "dfu <id> : request DFU mode for a bulb", .func = &cmd_dfu},
+        {.command = "sweep",    .help = "sweep <id> <channels> <duration_ms> : linear 0->255->0 loop (channels = r,g,b,ww,cw)", .func = &cmd_sweep},
+        {.command = "psweep",   .help = "psweep <id> <channels> <duration_ms> <min> <max> : precise float sweep between min%..max%", .func = &cmd_psweep},
+        {.command = "stopsweep",.help = "stop the active sweep(s)", .func = &cmd_stopsweep},
         {.command = "chan",     .help = "chan <1..13> : set broadcast channel", .func = &cmd_chan},
         {.command = "interval", .help = "interval <ms> : set beacon interval", .func = &cmd_interval},
         {.command = "start",    .help = "resume broadcasting", .func = &cmd_start},
