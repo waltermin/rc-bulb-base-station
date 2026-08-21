@@ -11,7 +11,10 @@
 //                                    scale% and sent as floats (one bulb at a time)
 //   clr <id>                         remove one bulb entry
 //   clrall                           remove all entries
-//   dfu <id>                         request DFU mode for a bulb (burst)
+//   dfu <id> [new|legacy]            request DFU (new=BulbCommand, legacy=0x01)
+//   setconfig <id> <key> <type> <value>
+//                                    set a bulb config key via BulbCommand
+//   seq [value]                      show / re-seed the BulbCommand seq counter
 //   sweep <id> <channels> <ms>       linear 0->255->0 loop over the channels
 //   psweep <id> <channels> <ms> <min> <max>
 //                                    precise float sweep bouncing between
@@ -22,10 +25,16 @@
 //   start | stop                     resume / pause broadcasting
 //   show                             print current state
 //
-// Two packet types go on the wire (selected by the first payload byte, a packet
-// tag): 0x01 LightUpdate carries the u8 entry table; 0x02 PreciseLightUpdate
-// carries one bulb's float channels. When a precise target is active it is
-// broadcast as its own beacon each tick, alongside the LightUpdate beacon.
+// Packet types on the wire (selected by the first payload byte, a packet tag):
+//   0x02 PreciseLightUpdate — one bulb's float channels (scaledset / psweep)
+//   0x03 LightUpdateV2      — the u8 entry table (set / sweep), continuously
+//   0x04 BulbCommand        — DFU + config management, sent as a burst
+//   0x01 LightUpdate        — deprecated; only emitted by `dfu <id> legacy`
+// The entry table (0x03) and any active precise target (0x02) are broadcast
+// continuously; BulbCommands (0x04) and legacy DFU (0x01) are one-shot bursts
+// (CMD_BURST_COUNT frames at CMD_BURST_INTERVAL_MS) so a momentary miss is
+// unlikely. Each BulbCommand carries a monotonically increasing seq; the bulb
+// acts on the first sighting of a new-highest seq (anti-replay).
 //
 // The bulb firmware expects channel 11 by default (WIFI_CHANNEL in its config.h).
 
@@ -36,6 +45,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
+#include "freertos/queue.h"
 
 #include "nvs_flash.h"
 #include "esp_event.h"
@@ -51,12 +61,22 @@ static const char *TAG = "base";
 #define OUI0 0x52
 #define OUI1 0x43
 #define OUI2 0x68
-#define TAG_LIGHT_UPDATE 0x01           // packet tag: u8 entry table
+#define TAG_LIGHT_UPDATE 0x01           // packet tag: (deprecated) u8 entry table + DFU
 #define TAG_PRECISE_LIGHT_UPDATE 0x02   // packet tag: one bulb, f32 channels
-#define CTRL_FLAG_DFU 0x01
+#define TAG_LIGHT_UPDATE_V2 0x03        // packet tag: u8 entry table, no DFU
+#define TAG_BULB_COMMAND 0x04           // packet tag: remote management (config / DFU)
+#define CTRL_FLAG_DFU 0x01              // legacy 0x01 control_flags value for DFU
+#define CMD_ENTER_DFU 0x00              // BulbCommand cmd: enter DFU (no payload)
+#define CMD_SET_CONFIG 0x01             // BulbCommand cmd: set config (key u16, len u8, value)
 #define MAX_ENTRIES 11
 #define ENTRY_SIZE 6
 #define PRECISE_BODY_SIZE (2 + 5 * 4)   // tag + bulb_id + 5 * f32
+#define CMD_VALUE_MAX 64                // max SetConfig value bytes (matches bulb PROTO_CONFIG_VALUE_MAX)
+
+// Every BulbCommand frame is sent this many times, this far apart, to ensure
+// delivery (the bulb acts on the first sighting of a new-highest seq).
+#define CMD_BURST_COUNT 10
+#define CMD_BURST_INTERVAL_MS 100
 
 // ---- color channel bits (for `sweep`) ---------------------------------------
 #define CH_R  0x01
@@ -108,14 +128,28 @@ typedef struct {
 
 static psweep_t s_psweep;
 
-static uint8_t s_control_flags = 0;
-static uint8_t s_control_data = 0;
-static int s_dfu_bursts_left = 0;   // while >0, keep control_flags=DFU then clear
 static int s_channel = 11;
 static int s_interval_ms = 200;
 static bool s_enabled = true;
 static uint8_t s_base_mac[6];
 static SemaphoreHandle_t s_lock;
+
+// BulbCommand sequence counter. Starts at 0; each issued command uses the
+// current value then increments (the bulb only acts on a new-highest seq).
+// Re-seedable via the `seq` command.
+static uint32_t s_seq = 0;
+
+// One-shot burst jobs: a fully-built frame to transmit `count` times at
+// `interval_ms`. Used for BulbCommands and legacy DFU. Serviced by burst_task so
+// the timing is independent of the continuous entry-table broadcast cadence.
+typedef struct {
+    uint8_t frame[160];
+    int len;
+    int count;
+    int interval_ms;
+} burst_job_t;
+
+static QueueHandle_t s_burst_queue;
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -151,17 +185,16 @@ static int write_vendor_ie(uint8_t *p, int n, const uint8_t *body, int blen) {
     return n;
 }
 
-// Build a complete 0x01 LightUpdate beacon (no FCS; hardware appends it) with
+// Build a complete 0x03 LightUpdateV2 beacon (no FCS; hardware appends it) with
 // our single vendor IE. Caller must hold the lock. Returns frame length.
 static int build_beacon(uint8_t *p) {
     int n = write_beacon_header(p);
 
-    // LightUpdatePacket body (tag 0x01)
-    uint8_t body[4 + MAX_ENTRIES * ENTRY_SIZE];
+    // LightUpdateV2 body (tag 0x03): tag, entry_count, then the entry table.
+    // (DFU moved out to BulbCommand, so there are no control fields here.)
+    uint8_t body[2 + MAX_ENTRIES * ENTRY_SIZE];
     int b = 0;
-    body[b++] = TAG_LIGHT_UPDATE;
-    body[b++] = s_control_flags;
-    body[b++] = s_control_data;
+    body[b++] = TAG_LIGHT_UPDATE_V2;
     int count_idx = b++;                          // entry_count placeholder
     int count = 0;
     for (int i = 0; i < MAX_ENTRIES; i++) {
@@ -177,6 +210,83 @@ static int build_beacon(uint8_t *p) {
     body[count_idx] = (uint8_t)count;
 
     return write_vendor_ie(p, n, body, b);
+}
+
+// Build a legacy 0x01 LightUpdate beacon whose only purpose is to trigger DFU on
+// `id` (control_flags=DFU, empty entry table). Only bulbs built with legacy
+// processing enabled will act on it. Caller must hold the lock. Returns length.
+static int build_legacy_dfu_beacon(uint8_t *p, uint8_t id) {
+    int n = write_beacon_header(p);
+    uint8_t body[4] = {TAG_LIGHT_UPDATE, CTRL_FLAG_DFU, id, 0 /* entry_count */};
+    return write_vendor_ie(p, n, body, sizeof(body));
+}
+
+// Build a 0x04 BulbCommand beacon addressed to ids [start, start+bounds] with the
+// given cmd and raw payload. Caller must hold the lock. Returns frame length.
+static int build_command_beacon(uint8_t *p, uint32_t seq, uint8_t start, uint8_t bounds,
+                                uint8_t cmd, const uint8_t *payload, int payload_len) {
+    int n = write_beacon_header(p);
+
+    // BulbCommand body: tag, seq(u32 LE), start, bounds, cmd, payload...
+    uint8_t body[8 + 3 + CMD_VALUE_MAX];
+    int b = 0;
+    body[b++] = TAG_BULB_COMMAND;
+    body[b++] = (uint8_t)(seq);
+    body[b++] = (uint8_t)(seq >> 8);
+    body[b++] = (uint8_t)(seq >> 16);
+    body[b++] = (uint8_t)(seq >> 24);
+    body[b++] = start;
+    body[b++] = bounds;
+    body[b++] = cmd;
+    for (int i = 0; i < payload_len; i++) body[b++] = payload[i];
+
+    return write_vendor_ie(p, n, body, b);
+}
+
+// ---- one-shot burst sender --------------------------------------------------
+// Queue a fully-built frame to be transmitted `count` times at `interval_ms`.
+static void enqueue_burst(const uint8_t *frame, int len, int count, int interval_ms) {
+    burst_job_t job;
+    if (len > (int)sizeof(job.frame)) return;  // never happens for our frames
+    memcpy(job.frame, frame, len);
+    job.len = len;
+    job.count = count;
+    job.interval_ms = interval_ms;
+    if (xQueueSend(s_burst_queue, &job, 0) != pdTRUE) {
+        printf("burst queue full; frame dropped\n");
+    }
+}
+
+// Build and enqueue a BulbCommand, consuming (and advancing) the seq counter.
+// Not holding the lock on entry. Informs the user of the seq that was used and
+// the next seq to be issued.
+static void issue_command(uint8_t start, uint8_t bounds, uint8_t cmd,
+                          const uint8_t *payload, int payload_len) {
+    static uint8_t frame[160];
+    LOCK();
+    uint32_t used = s_seq;
+    int len = build_command_beacon(frame, used, start, bounds, cmd, payload, payload_len);
+    s_seq++;
+    uint32_t next = s_seq;
+    enqueue_burst(frame, len, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS);
+    UNLOCK();
+    printf("BulbCommand sent with seq=%u (%dx @ %d ms); seq now %u\n",
+           (unsigned)used, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS, (unsigned)next);
+}
+
+// Transmit queued burst frames, `count` times each at `interval_ms`. Runs
+// independently of the continuous entry-table broadcast.
+static void burst_task(void *arg) {
+    (void)arg;
+    burst_job_t job;
+    for (;;) {
+        if (xQueueReceive(s_burst_queue, &job, portMAX_DELAY) != pdTRUE) continue;
+        for (int i = 0; i < job.count; i++) {
+            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, job.frame, job.len, true);
+            if (e != ESP_OK) ESP_LOGW(TAG, "burst tx failed: %s", esp_err_to_name(e));
+            if (i + 1 < job.count) vTaskDelay(pdMS_TO_TICKS(job.interval_ms));
+        }
+    }
 }
 
 // Build a complete 0x02 PreciseLightUpdate beacon for the active precise target.
@@ -269,13 +379,6 @@ static void broadcast_task(void *arg) {
         if (enabled) {
             if (s_sweep.active) apply_sweep();
             len = build_beacon(frame);
-            // DFU is a limited burst: count it down, then stop requesting it.
-            if (s_control_flags == CTRL_FLAG_DFU && s_dfu_bursts_left > 0) {
-                if (--s_dfu_bursts_left == 0) {
-                    s_control_flags = 0;
-                    s_control_data = 0;
-                }
-            }
             // A precise target rides along as its own separate beacon (a beacon
             // may carry only our one vendor IE, so it cannot share the frame).
             if (s_precise.active) {
@@ -436,15 +539,106 @@ static int cmd_clrall(int argc, char **argv) {
 }
 
 static int cmd_dfu(int argc, char **argv) {
-    if (argc != 2) { printf("usage: dfu <id>\n"); return 1; }
+    if (argc < 2 || argc > 3) {
+        printf("usage: dfu <id> [new|legacy]\n");
+        printf("  new (default): BulbCommand EnterDfuMode (0x04)\n");
+        printf("  legacy       : deprecated LightUpdate DFU (0x01), for old bulbs\n");
+        return 1;
+    }
     uint8_t id;
     if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
-    LOCK();
-    s_control_flags = CTRL_FLAG_DFU;
-    s_control_data = id;
-    s_dfu_bursts_left = 25;  // ~5 s at 200 ms
-    UNLOCK();
-    printf("requesting DFU for bulb %d (burst)\n", id);
+
+    bool legacy = false;
+    if (argc == 3) {
+        if (!strcmp(argv[2], "legacy"))   legacy = true;
+        else if (!strcmp(argv[2], "new")) legacy = false;
+        else { printf("bad mode '%s' (use 'new' or 'legacy')\n", argv[2]); return 1; }
+    }
+
+    if (legacy) {
+        uint8_t frame[160];
+        LOCK();
+        int len = build_legacy_dfu_beacon(frame, id);
+        UNLOCK();
+        enqueue_burst(frame, len, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS);
+        printf("requesting DFU for bulb %d via legacy LightUpdate (%dx @ %d ms)\n",
+               id, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS);
+    } else {
+        printf("requesting DFU for bulb %d via BulbCommand\n", id);
+        issue_command(id, 0, CMD_ENTER_DFU, NULL, 0);
+    }
+    return 0;
+}
+
+// setconfig <id> <key> <u8|u32|f32|str> <value> : issue a SetConfig BulbCommand.
+static int cmd_setconfig(int argc, char **argv) {
+    if (argc != 5) {
+        printf("usage: setconfig <id> <key> <u8|u32|f32|str> <value>\n");
+        printf("  key: 16-bit config tag (e.g. 0x0031); value encoded per type (LE)\n");
+        return 1;
+    }
+    uint8_t id;
+    if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
+
+    char *end;
+    long k = strtol(argv[2], &end, 0);
+    if (*end != '\0' || k < 0 || k > 0xFFFF) {
+        printf("bad key '%s' (0..65535)\n", argv[2]);
+        return 1;
+    }
+    uint16_t key = (uint16_t)k;
+
+    const char *type = argv[3];
+    const char *vs = argv[4];
+    uint8_t value[CMD_VALUE_MAX];
+    int vlen = 0;
+
+    if (!strcmp(type, "u8")) {
+        long v = strtol(vs, &end, 0);
+        if (*end != '\0' || v < 0 || v > 255) { printf("bad u8 value '%s'\n", vs); return 1; }
+        value[0] = (uint8_t)v; vlen = 1;
+    } else if (!strcmp(type, "u32")) {
+        unsigned long v = strtoul(vs, &end, 0);
+        if (*end != '\0') { printf("bad u32 value '%s'\n", vs); return 1; }
+        value[0] = (uint8_t)v; value[1] = (uint8_t)(v >> 8);
+        value[2] = (uint8_t)(v >> 16); value[3] = (uint8_t)(v >> 24); vlen = 4;
+    } else if (!strcmp(type, "f32")) {
+        double v = strtod(vs, &end);
+        if (end == vs || *end != '\0') { printf("bad f32 value '%s'\n", vs); return 1; }
+        float f = (float)v; memcpy(value, &f, 4); vlen = 4;
+    } else if (!strcmp(type, "str")) {
+        size_t sl = strlen(vs);
+        if (sl > CMD_VALUE_MAX - 1) { printf("string too long (max %d)\n", CMD_VALUE_MAX - 1); return 1; }
+        memcpy(value, vs, sl); vlen = (int)sl;
+    } else {
+        printf("bad type '%s' (u8|u32|f32|str)\n", type);
+        return 1;
+    }
+
+    uint8_t payload[3 + CMD_VALUE_MAX];
+    payload[0] = (uint8_t)key;
+    payload[1] = (uint8_t)(key >> 8);
+    payload[2] = (uint8_t)vlen;
+    memcpy(&payload[3], value, vlen);
+
+    printf("setconfig bulb %d key 0x%04x = %s (%s, %d bytes)\n", id, key, vs, type, vlen);
+    issue_command(id, 0, CMD_SET_CONFIG, payload, 3 + vlen);
+    return 0;
+}
+
+// seq [value] : show, or re-seed, the BulbCommand sequence counter.
+static int cmd_seq(int argc, char **argv) {
+    if (argc == 1) {
+        LOCK(); uint32_t s = s_seq; UNLOCK();
+        printf("seq = %u\n", (unsigned)s);
+        return 0;
+    }
+    if (argc != 2) { printf("usage: seq [value]\n"); return 1; }
+    char *end;
+    unsigned long v = strtoul(argv[1], &end, 0);
+    if (*end != '\0') { printf("bad seq '%s'\n", argv[1]); return 1; }
+    LOCK(); s_seq = (uint32_t)v; UNLOCK();
+    printf("seq re-seeded to %u\n", (unsigned)v);
     return 0;
 }
 
@@ -566,8 +760,8 @@ static int cmd_stop(int argc, char **argv) {
 static int cmd_show(int argc, char **argv) {
     (void)argc; (void)argv;
     LOCK();
-    printf("state: %s  channel %d  interval %d ms  control_flags %d control_data %d\n",
-           s_enabled ? "ON" : "OFF", s_channel, s_interval_ms, s_control_flags, s_control_data);
+    printf("state: %s  channel %d  interval %d ms  next seq %u\n",
+           s_enabled ? "ON" : "OFF", s_channel, s_interval_ms, (unsigned)s_seq);
     printf("base MAC (frame src): %02x:%02x:%02x:%02x:%02x:%02x\n",
            s_base_mac[0], s_base_mac[1], s_base_mac[2], s_base_mac[3], s_base_mac[4], s_base_mac[5]);
     if (s_sweep.active) {
@@ -656,7 +850,9 @@ static void register_commands(void) {
         {.command = "scaledset",.help = "scaledset <id> <r> <g> <b> <ww> <cw> <scale> : PreciseLightUpdate, channels scaled by scale%", .func = &cmd_scaledset},
         {.command = "clr",      .help = "clr <id> : remove one bulb entry", .func = &cmd_clr},
         {.command = "clrall",   .help = "remove all bulb entries", .func = &cmd_clrall},
-        {.command = "dfu",      .help = "dfu <id> : request DFU mode for a bulb", .func = &cmd_dfu},
+        {.command = "dfu",      .help = "dfu <id> [new|legacy] : request DFU (new=BulbCommand, legacy=0x01)", .func = &cmd_dfu},
+        {.command = "setconfig",.help = "setconfig <id> <key> <u8|u32|f32|str> <value> : SetConfig BulbCommand", .func = &cmd_setconfig},
+        {.command = "seq",      .help = "seq [value] : show or re-seed the BulbCommand sequence counter", .func = &cmd_seq},
         {.command = "sweep",    .help = "sweep <id> <channels> <duration_ms> : linear 0->255->0 loop (channels = r,g,b,ww,cw)", .func = &cmd_sweep},
         {.command = "psweep",   .help = "psweep <id> <channels> <duration_ms> <min> <max> : precise float sweep between min%..max%", .func = &cmd_psweep},
         {.command = "stopsweep",.help = "stop the active sweep(s)", .func = &cmd_stopsweep},
@@ -700,9 +896,13 @@ void app_main(void) {
     s_lock = xSemaphoreCreateMutex();
     configASSERT(s_lock != NULL);
 
+    s_burst_queue = xQueueCreate(8, sizeof(burst_job_t));
+    configASSERT(s_burst_queue != NULL);
+
     wifi_init_tx();
 
     xTaskCreate(broadcast_task, "broadcast", 4096, NULL, 5, NULL);
+    xTaskCreate(burst_task, "burst", 4096, NULL, 5, NULL);
 
     // Serial REPL over the USB UART.
     esp_console_repl_t *repl = NULL;

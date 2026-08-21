@@ -40,28 +40,53 @@ Console runs at **115200 baud**. Type `help` for the list.
 
 | Command | Effect |
 |---|---|
-| `set <id> <r> <g> <b> <ww> <cw>` | add/update a bulb entry, `LightUpdate` (values 0..255) |
+| `set <id> <r> <g> <b> <ww> <cw>` | add/update a bulb entry, `LightUpdateV2` (values 0..255) |
 | `scaledset <id> <r> <g> <b> <ww> <cw> <scale>` | `PreciseLightUpdate`: each channel (`0..255`, fractional ok) is normalized (`/255`) then multiplied by `scale`% and sent as a float — all math in float space; one bulb at a time |
 | `clr <id>` | remove one entry |
 | `clrall` | remove all entries |
-| `dfu <id>` | request DFU mode for a bulb (~5 s burst, then auto-clears) |
+| `dfu <id> [new\|legacy]` | request DFU mode for a bulb. `new` (default) sends a `BulbCommand` (`0x04`); `legacy` sends the deprecated `LightUpdate` DFU (`0x01`) for bulbs built with legacy processing enabled |
+| `setconfig <id> <key> <u8\|u32\|f32\|str> <value>` | set a bulb config key via `BulbCommand`. `key` is the 16-bit config tag (e.g. `0x0031` = gamma); `value` is encoded little-endian per the given type |
+| `seq [value]` | show, or re-seed, the `BulbCommand` sequence counter |
 | `sweep <id> <channels> <ms>` | smooth linear `0→255→0` loop over `channels` (comma list of `r,g,b,ww,cw`) with a full cycle every `<ms>` |
 | `psweep <id> <channels> <ms> <min> <max>` | precise float sweep: triangle-wave over `channels` bouncing between `min`%..`max`% of full scale every `<ms>`; one bulb at a time |
 | `stopsweep` | stop the active sweep(s), linear and precise (channels freeze at their last value) |
-| `chan <1..13>` | broadcast channel (bulb defaults to 1) |
+| `chan <1..13>` | broadcast channel (bulb defaults to 11) |
 | `interval <ms>` | beacon interval (default 200 ms) |
 | `start` / `stop` | resume / pause broadcasting |
-| `show` | print current state |
+| `show` | print current state (incl. the next `seq`) |
 
 A background task broadcasts the current entry table continuously, so once you
 `set` a bulb it keeps receiving updates (and its 15 s fallback never fires). Stop
 broadcasting (or `clr` the entry) to watch a bulb fall back to its default color.
 
-The `LightUpdate` (0x01) entry table and the single `PreciseLightUpdate` (0x02)
+The `LightUpdateV2` (0x03) entry table and the single `PreciseLightUpdate` (0x02)
 target are independent: each beacon carries only our one vendor IE, so a precise
 target is broadcast as its own extra beacon each tick, right after the entry
 table. Only one bulb can be precisely controlled at a time — a new `scaledset`
 or `psweep` replaces the previous precise target.
+
+### BulbCommand (`dfu` / `setconfig`)
+
+`dfu` and `setconfig` issue a `BulbCommand` (`0x04`): a one-shot management
+packet, distinct from the continuously-broadcast entry table. Each is
+transmitted **10 times at 100 ms intervals** to ensure delivery, then stops.
+
+Every `BulbCommand` carries a **`seq`** (starts at `0`, auto-increments per
+command). Each bulb tracks the highest `seq` it has seen since power-on and acts
+on a command only the first time it sees a *new* highest `seq` — so the 10-frame
+burst is applied exactly once, and a stale re-send is ignored. The console prints
+the `seq` each time it advances. If you **reboot the base station**, `seq` resets
+to `0` while a still-powered bulb remembers a higher value and will ignore new
+commands; use `seq <value>` to jump the counter back above what the bulb has
+seen.
+
+`setconfig` targets the config keys in the bulb's NVS store. Example — switch a
+bulb to the gamma duty curve, then set gamma to 2.6:
+
+```
+setconfig 1 0x0030 u8 0        # duty_curve = PWM_CURVE_GAMMA
+setconfig 1 0x0031 f32 2.6     # gamma = 2.6
+```
 
 ## Testing flow with a bulb (id 1)
 
@@ -73,8 +98,9 @@ sweep 1 r,g,b 3000       # bulb 1 -> smooth 0->255->0 breathing on RGB, 3 s/cycl
 psweep 1 ww 4000 10 90   # bulb 1 -> precise warm-white breathe between 10% and 90%
 stopsweep                # freeze the sweep(s) where they are
 clr 1                    # stop addressing it -> reverts to default after ~15 s
-dfu 1                    # bulb 1 leaves promiscuous, joins the DFU AP
+setconfig 1 0x0031 f32 2.6  # bulb 1 -> gamma = 2.6 (persisted to NVS)
+dfu 1                    # bulb 1 leaves promiscuous, joins the DFU AP (BulbCommand)
 ```
 
-Keep the base station and bulb on the **same channel** (1 by default). Note the
+Keep the base station and bulb on the **same channel** (11 by default). Note the
 bulb's console is 74880 baud, the base station's is 115200.
