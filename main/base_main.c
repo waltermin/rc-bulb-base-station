@@ -6,21 +6,31 @@
 //
 // Commands (type `help`):
 //   set <id> <r> <g> <b> <ww> <cw>   add/update a bulb entry (values 0..255)
+//   setrange <first> <last> <r> <g> <b> <ww> <cw>
+//                                    add/update entries for every id in
+//                                    first..last (inclusive) with one color
 //   scaledset <id> <r> <g> <b> <ww> <cw> <scale>
 //                                    PreciseLightUpdate: channels scaled by
 //                                    scale% and sent as floats (one bulb at a time)
 //   clr <id>                         remove one bulb entry
 //   clrall                           remove all entries
 //   dfu <id> [new|legacy]            request DFU (new=BulbCommand, legacy=0x01)
+//   dfurange <first> <last>          DFU every id in first..last, one BulbCommand
+//                                    burst per bulb in sequence, with progress
 //   setconfig <id> <key> <type> <value>
 //                                    set a bulb config key via BulbCommand
 //   seq [value]                      show / re-seed the BulbCommand seq counter
 //   sweep <id> <channels> <ms>       linear 0->255->0 loop over the channels
+//   sweeprange <first> <last> <channels> <ms>
+//                                    same sweep applied in lockstep to every
+//                                    id in first..last (inclusive)
 //   psweep <id> <channels> <ms> <min> <max>
 //                                    precise float sweep bouncing between
 //                                    min%..max% of full scale (one bulb at a time)
 //   stopsweep                        stop the active sweep(s)
 //   chan <1..13>                     set the broadcast channel
+//   rate <1|2|5.5|11|6|9|12|18|24|36|48|54>
+//                                    set the PHY rate frames are injected at
 //   interval <ms>                    set the beacon interval
 //   start | stop                     resume / pause broadcasting
 //   show                             print current state
@@ -30,8 +40,10 @@
 //   0x03 LightUpdateV2      — the u8 entry table (set / sweep), continuously
 //   0x04 BulbCommand        — DFU + config management, sent as a burst
 //   0x01 LightUpdate        — deprecated; only emitted by `dfu <id> legacy`
-// The entry table (0x03) and any active precise target (0x02) are broadcast
-// continuously; BulbCommands (0x04) and legacy DFU (0x01) are one-shot bursts
+// The entry table (0x03) holds up to MAX_ENTRIES bulbs, but a bulb only accepts
+// ENTRIES_PER_PACKET entries per packet, so each tick the table is sharded into
+// ceil(n / ENTRIES_PER_PACKET) back-to-back beacons. The entry table and any
+// active precise target (0x02) are broadcast continuously; BulbCommands (0x04) and legacy DFU (0x01) are one-shot bursts
 // (CMD_BURST_COUNT frames at CMD_BURST_INTERVAL_MS) so a momentary miss is
 // unlikely. Each BulbCommand carries a monotonically increasing seq; the bulb
 // acts on the first sighting of a new-highest seq (anti-replay).
@@ -68,8 +80,11 @@ static const char *TAG = "base";
 #define CTRL_FLAG_DFU 0x01              // legacy 0x01 control_flags value for DFU
 #define CMD_ENTER_DFU 0x00              // BulbCommand cmd: enter DFU (no payload)
 #define CMD_SET_CONFIG 0x01             // BulbCommand cmd: set config (key u16, len u8, value)
-#define MAX_ENTRIES 11
+#define MAX_ENTRIES 64                  // size of our entry table (sharded on the wire)
+#define ENTRIES_PER_PACKET 11           // bulb-side limit per packet (PROTO_MAX_ENTRIES)
 #define ENTRY_SIZE 6
+#define MAX_SHARDS ((MAX_ENTRIES + ENTRIES_PER_PACKET - 1) / ENTRIES_PER_PACKET)
+#define SHARD_FRAME_SIZE 128            // >= 36 hdr + 5 IE hdr + 2 + 11*6 = 109
 #define PRECISE_BODY_SIZE (2 + 5 * 4)   // tag + bulb_id + 5 * f32
 #define CMD_VALUE_MAX 64                // max SetConfig value bytes (matches bulb PROTO_CONFIG_VALUE_MAX)
 
@@ -94,10 +109,11 @@ typedef struct {
 static entry_t s_entries[MAX_ENTRIES];
 
 // One active linear triangle-wave sweep: 0 -> 255 -> 0 over `period_ms`, looping
-// until stopped. Applied to `mask`ed channels of bulb `id` each broadcast tick.
+// until stopped. Applied in lockstep to the `mask`ed channels of every bulb with
+// id in first..last (inclusive) each broadcast tick (`sweep` sets first==last).
 typedef struct {
     bool active;
-    uint8_t id;
+    uint8_t first, last;
     uint8_t mask;        // OR of CH_* bits
     int period_ms;       // full 0->255->0 cycle
     int64_t start_us;    // esp_timer_get_time() when the sweep began
@@ -130,6 +146,22 @@ static psweep_t s_psweep;
 
 static int s_channel = 11;
 static int s_interval_ms = 200;
+
+// PHY rate for injected frames. The default for esp_wifi_80211_tx is the
+// 1 Mbps basic rate, where a ~110-byte shard costs ~1.3 ms of air; at 55+ bulbs
+// and a 10 ms interval that saturates the channel and the driver's TX pool
+// overflows (ESP_ERR_NO_MEM). 11 Mbps (802.11b, long preamble) cuts per-frame
+// airtime ~4x and is still a legacy rate the bulb's sniffer handles.
+typedef struct { const char *name; wifi_phy_rate_t rate; } rate_opt_t;
+static const rate_opt_t s_rate_opts[] = {
+    {"1",   WIFI_PHY_RATE_1M_L},  {"2",  WIFI_PHY_RATE_2M_L},  {"5.5", WIFI_PHY_RATE_5M_L},
+    {"11",  WIFI_PHY_RATE_11M_L}, {"6",  WIFI_PHY_RATE_6M},    {"9",   WIFI_PHY_RATE_9M},
+    {"12",  WIFI_PHY_RATE_12M},   {"18", WIFI_PHY_RATE_18M},   {"24",  WIFI_PHY_RATE_24M},
+    {"36",  WIFI_PHY_RATE_36M},   {"48", WIFI_PHY_RATE_48M},   {"54",  WIFI_PHY_RATE_54M},
+};
+#define N_RATE_OPTS ((int)(sizeof(s_rate_opts) / sizeof(s_rate_opts[0])))
+#define DEFAULT_RATE_IDX 3   // 11 Mbps
+static int s_rate_idx = DEFAULT_RATE_IDX;
 static bool s_enabled = true;
 static uint8_t s_base_mac[6];
 static SemaphoreHandle_t s_lock;
@@ -147,9 +179,14 @@ typedef struct {
     int len;
     int count;
     int interval_ms;
+    SemaphoreHandle_t done;   // optional: given by burst_task when the last frame is out
 } burst_job_t;
 
 static QueueHandle_t s_burst_queue;
+
+// dfurange progress: a background task walks first..last issuing one DFU
+// BulbCommand burst per bulb, waiting for each to finish. Only one at a time.
+static bool s_dfurange_active;
 
 #define LOCK() xSemaphoreTake(s_lock, portMAX_DELAY)
 #define UNLOCK() xSemaphoreGive(s_lock)
@@ -185,19 +222,22 @@ static int write_vendor_ie(uint8_t *p, int n, const uint8_t *body, int blen) {
     return n;
 }
 
-// Build a complete 0x03 LightUpdateV2 beacon (no FCS; hardware appends it) with
-// our single vendor IE. Caller must hold the lock. Returns frame length.
-static int build_beacon(uint8_t *p) {
+// Build one 0x03 LightUpdateV2 beacon (no FCS; hardware appends it) with our
+// single vendor IE, carrying up to ENTRIES_PER_PACKET used entries starting the
+// scan at table index *pos. Advances *pos past the entries consumed. Caller must
+// hold the lock. Returns frame length.
+static int build_beacon_shard(uint8_t *p, int *pos) {
     int n = write_beacon_header(p);
 
     // LightUpdateV2 body (tag 0x03): tag, entry_count, then the entry table.
     // (DFU moved out to BulbCommand, so there are no control fields here.)
-    uint8_t body[2 + MAX_ENTRIES * ENTRY_SIZE];
+    uint8_t body[2 + ENTRIES_PER_PACKET * ENTRY_SIZE];
     int b = 0;
     body[b++] = TAG_LIGHT_UPDATE_V2;
     int count_idx = b++;                          // entry_count placeholder
     int count = 0;
-    for (int i = 0; i < MAX_ENTRIES; i++) {
+    int i = *pos;
+    for (; i < MAX_ENTRIES && count < ENTRIES_PER_PACKET; i++) {
         if (!s_entries[i].used) continue;
         body[b++] = s_entries[i].id;
         body[b++] = s_entries[i].r;
@@ -208,8 +248,30 @@ static int build_beacon(uint8_t *p) {
         count++;
     }
     body[count_idx] = (uint8_t)count;
+    *pos = i;
 
     return write_vendor_ie(p, n, body, b);
+}
+
+// Number of used entries at table index >= pos. Caller must hold the lock.
+static int count_entries_from(int pos) {
+    int count = 0;
+    for (int i = pos; i < MAX_ENTRIES; i++) if (s_entries[i].used) count++;
+    return count;
+}
+
+// Shard the whole entry table into back-to-back beacons of at most
+// ENTRIES_PER_PACKET entries each. `frames` holds MAX_SHARDS frames of
+// SHARD_FRAME_SIZE bytes; `lens[i]` receives each frame's length. An empty table
+// still yields one (empty) beacon. Caller must hold the lock. Returns the shard
+// count.
+static int build_beacon_shards(uint8_t frames[][SHARD_FRAME_SIZE], int *lens) {
+    int pos = 0, shards = 0;
+    do {
+        lens[shards] = build_beacon_shard(frames[shards], &pos);
+        shards++;
+    } while (shards < MAX_SHARDS && count_entries_from(pos) > 0);
+    return shards;
 }
 
 // Build a legacy 0x01 LightUpdate beacon whose only purpose is to trigger DFU on
@@ -245,33 +307,55 @@ static int build_command_beacon(uint8_t *p, uint32_t seq, uint8_t start, uint8_t
 
 // ---- one-shot burst sender --------------------------------------------------
 // Queue a fully-built frame to be transmitted `count` times at `interval_ms`.
-static void enqueue_burst(const uint8_t *frame, int len, int count, int interval_ms) {
+// `done` (may be NULL) is given once the last frame has been handed to the
+// driver. `wait` controls how long to block if the queue is full (the console
+// passes 0 and drops; dfurange blocks). Returns true if queued.
+static bool enqueue_burst_ex(const uint8_t *frame, int len, int count, int interval_ms,
+                             SemaphoreHandle_t done, TickType_t wait) {
     burst_job_t job;
-    if (len > (int)sizeof(job.frame)) return;  // never happens for our frames
+    if (len > (int)sizeof(job.frame)) return false;  // never happens for our frames
     memcpy(job.frame, frame, len);
     job.len = len;
     job.count = count;
     job.interval_ms = interval_ms;
-    if (xQueueSend(s_burst_queue, &job, 0) != pdTRUE) {
+    job.done = done;
+    if (xQueueSend(s_burst_queue, &job, wait) != pdTRUE) {
         printf("burst queue full; frame dropped\n");
+        return false;
     }
+    return true;
+}
+
+static void enqueue_burst(const uint8_t *frame, int len, int count, int interval_ms) {
+    enqueue_burst_ex(frame, len, count, interval_ms, NULL, 0);
 }
 
 // Build and enqueue a BulbCommand, consuming (and advancing) the seq counter.
-// Not holding the lock on entry. Informs the user of the seq that was used and
-// the next seq to be issued.
-static void issue_command(uint8_t start, uint8_t bounds, uint8_t cmd,
-                          const uint8_t *payload, int payload_len) {
-    static uint8_t frame[160];
+// Not holding the lock on entry. Returns the seq that was used (or 0 and
+// *queued=false if the burst could not be queued).
+static uint32_t issue_command_ex(uint8_t start, uint8_t bounds, uint8_t cmd,
+                                 const uint8_t *payload, int payload_len,
+                                 SemaphoreHandle_t done, TickType_t wait, bool *queued) {
+    uint8_t frame[160];
     LOCK();
     uint32_t used = s_seq;
     int len = build_command_beacon(frame, used, start, bounds, cmd, payload, payload_len);
     s_seq++;
-    uint32_t next = s_seq;
-    enqueue_burst(frame, len, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS);
     UNLOCK();
+    // Queue outside the lock: with a nonzero wait this may block while the
+    // burst task drains earlier jobs, and it must not hold up the broadcaster.
+    bool ok = enqueue_burst_ex(frame, len, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS, done, wait);
+    if (queued) *queued = ok;
+    return used;
+}
+
+// Console variant: fire-and-forget, and inform the user of the seq that was
+// used and the next seq to be issued.
+static void issue_command(uint8_t start, uint8_t bounds, uint8_t cmd,
+                          const uint8_t *payload, int payload_len) {
+    uint32_t used = issue_command_ex(start, bounds, cmd, payload, payload_len, NULL, 0, NULL);
     printf("BulbCommand sent with seq=%u (%dx @ %d ms); seq now %u\n",
-           (unsigned)used, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS, (unsigned)next);
+           (unsigned)used, CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS, (unsigned)(used + 1));
 }
 
 // Transmit queued burst frames, `count` times each at `interval_ms`. Runs
@@ -286,7 +370,42 @@ static void burst_task(void *arg) {
             if (e != ESP_OK) ESP_LOGW(TAG, "burst tx failed: %s", esp_err_to_name(e));
             if (i + 1 < job.count) vTaskDelay(pdMS_TO_TICKS(job.interval_ms));
         }
+        if (job.done) xSemaphoreGive(job.done);
     }
+}
+
+// dfurange worker: one DFU BulbCommand burst per bulb, in order, each one
+// waited for before the next is issued, printing progress after every burst.
+// Total time is (last - first + 1) * CMD_BURST_COUNT * CMD_BURST_INTERVAL_MS.
+typedef struct { uint8_t first, last; } dfurange_args_t;
+
+static void dfurange_task(void *arg) {
+    dfurange_args_t a = *(dfurange_args_t *)arg;
+    free(arg);
+    int total = a.last - a.first + 1;
+
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    configASSERT(done != NULL);
+
+    int sent = 0;
+    for (int id = a.first; id <= a.last; id++) {
+        bool queued;
+        uint32_t seq = issue_command_ex((uint8_t)id, 0, CMD_ENTER_DFU, NULL, 0,
+                                        done, portMAX_DELAY, &queued);
+        if (!queued) {
+            printf("dfurange: failed to queue burst for bulb %d; aborting\n", id);
+            break;
+        }
+        xSemaphoreTake(done, portMAX_DELAY);
+        sent++;
+        printf("dfurange: bulb %d DFU sent (seq %u)  [%d/%d, %d remaining]\n",
+               id, (unsigned)seq, sent, total, total - sent);
+    }
+    printf("dfurange: done, %d/%d bulbs (%d..%d) sent DFU\n", sent, total, a.first, a.last);
+
+    vSemaphoreDelete(done);
+    LOCK(); s_dfurange_active = false; UNLOCK();
+    vTaskDelete(NULL);
 }
 
 // Build a complete 0x02 PreciseLightUpdate beacon for the active precise target.
@@ -315,12 +434,10 @@ static int find_entry(uint8_t id) {
     return -1;
 }
 
-// Write the current triangle-wave value into the swept channels of the target
-// bulb. Caller must hold the lock. If the entry vanished (cleared), stop.
+// Write the current triangle-wave value into the swept channels of every entry
+// in the sweep's id range. Caller must hold the lock. If no entry in the range
+// remains (all cleared), stop.
 static void apply_sweep(void) {
-    int idx = find_entry(s_sweep.id);
-    if (idx < 0) { s_sweep.active = false; return; }
-
     int64_t period = (int64_t)s_sweep.period_ms * 1000;   // us
     int64_t half = period / 2;
     int64_t phase = (esp_timer_get_time() - s_sweep.start_us) % period;
@@ -329,12 +446,36 @@ static void apply_sweep(void) {
                                : (255 * (period - phase)) / half;
     uint8_t val = (uint8_t)v;
 
-    entry_t *e = &s_entries[idx];
-    if (s_sweep.mask & CH_R)  e->r  = val;
-    if (s_sweep.mask & CH_G)  e->g  = val;
-    if (s_sweep.mask & CH_B)  e->b  = val;
-    if (s_sweep.mask & CH_WW) e->ww = val;
-    if (s_sweep.mask & CH_CW) e->cw = val;
+    int touched = 0;
+    for (int i = 0; i < MAX_ENTRIES; i++) {
+        entry_t *e = &s_entries[i];
+        if (!e->used || e->id < s_sweep.first || e->id > s_sweep.last) continue;
+        if (s_sweep.mask & CH_R)  e->r  = val;
+        if (s_sweep.mask & CH_G)  e->g  = val;
+        if (s_sweep.mask & CH_B)  e->b  = val;
+        if (s_sweep.mask & CH_WW) e->ww = val;
+        if (s_sweep.mask & CH_CW) e->cw = val;
+        touched++;
+    }
+    if (!touched) s_sweep.active = false;
+}
+
+// Make sure an entry exists for every id in first..last, seeding new ones at
+// all-zero (channels not being swept keep whatever they already hold). Atomic:
+// returns false, changing nothing, if the new ids won't fit. Caller holds lock.
+static bool ensure_range_entries(int first, int last) {
+    int existing = 0;
+    for (int id = first; id <= last; id++)
+        if (find_entry((uint8_t)id) >= 0) existing++;
+    int needed = (last - first + 1) - existing;
+    if (needed > MAX_ENTRIES - count_entries_from(0)) return false;
+    int next_free = 0;
+    for (int id = first; id <= last; id++) {
+        if (find_entry((uint8_t)id) >= 0) continue;
+        while (s_entries[next_free].used) next_free++;
+        s_entries[next_free] = (entry_t){.used = true, .id = (uint8_t)id};
+    }
+    return true;
 }
 
 // Write the current triangle-wave value into the swept channels of the precise
@@ -359,14 +500,15 @@ static void apply_psweep(void) {
 // ---- broadcast task ---------------------------------------------------------
 static void broadcast_task(void *arg) {
     (void)arg;
-    static uint8_t frame[128];
+    static uint8_t frames[MAX_SHARDS][SHARD_FRAME_SIZE];
+    static int lens[MAX_SHARDS];
     static uint8_t pframe[128];
     int applied_channel = -1;
 
     for (;;) {
         int interval;
         bool enabled;
-        int len = 0;
+        int shards = 0;
         int plen = 0;
 
         LOCK();
@@ -378,7 +520,7 @@ static void broadcast_task(void *arg) {
         }
         if (enabled) {
             if (s_sweep.active) apply_sweep();
-            len = build_beacon(frame);
+            shards = build_beacon_shards(frames, lens);
             // A precise target rides along as its own separate beacon (a beacon
             // may carry only our one vendor IE, so it cannot share the frame).
             if (s_precise.active) {
@@ -388,10 +530,13 @@ static void broadcast_task(void *arg) {
         }
         UNLOCK();
 
-        if (enabled && len > 0) {
-            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frame, len, true);
+        // Entry-table shards go out back-to-back; each carries a disjoint slice
+        // of the table, so together they address every entry once per tick.
+        for (int i = 0; enabled && i < shards; i++) {
+            esp_err_t e = esp_wifi_80211_tx(WIFI_IF_STA, frames[i], lens[i], true);
             if (e != ESP_OK) {
-                ESP_LOGW(TAG, "80211_tx failed: %s", esp_err_to_name(e));
+                ESP_LOGW(TAG, "80211_tx (shard %d/%d) failed: %s", i + 1, shards,
+                         esp_err_to_name(e));
             }
         }
         if (enabled && plen > 0) {
@@ -483,6 +628,48 @@ static int cmd_set(int argc, char **argv) {
     return 0;
 }
 
+// setrange <first> <last> <r> <g> <b> <ww> <cw> : set every id in first..last
+// (inclusive) to one color. Atomic: either every id fits in the table or
+// nothing changes.
+static int cmd_setrange(int argc, char **argv) {
+    if (argc != 8) {
+        printf("usage: setrange <first> <last> <r> <g> <b> <ww> <cw>\n");
+        printf("  sets every bulb id in first..last (inclusive) to the same color (values 0..255)\n");
+        return 1;
+    }
+    uint8_t v[7];
+    for (int i = 0; i < 7; i++) {
+        if (!parse_u8(argv[i + 1], &v[i])) {
+            printf("bad value '%s' (0..255)\n", argv[i + 1]);
+            return 1;
+        }
+    }
+    int first = v[0], last = v[1];
+    if (first > last) { printf("first must be <= last\n"); return 1; }
+    int span = last - first + 1;
+    if (span > MAX_ENTRIES) {
+        printf("range covers %d bulbs (max %d)\n", span, MAX_ENTRIES);
+        return 1;
+    }
+
+    LOCK();
+    if (!ensure_range_entries(first, last)) {
+        int free_slots = MAX_ENTRIES - count_entries_from(0);
+        UNLOCK();
+        printf("not enough free entry slots (%d free, max %d)\n", free_slots, MAX_ENTRIES);
+        return 1;
+    }
+    for (int i = 0; i < MAX_ENTRIES; i++) {
+        entry_t *e = &s_entries[i];
+        if (!e->used || e->id < first || e->id > last) continue;
+        e->r = v[2]; e->g = v[3]; e->b = v[4]; e->ww = v[5]; e->cw = v[6];
+    }
+    UNLOCK();
+    printf("set bulbs %d..%d (%d) -> r%d g%d b%d ww%d cw%d\n", first, last, span,
+           v[2], v[3], v[4], v[5], v[6]);
+    return 0;
+}
+
 static int cmd_scaledset(int argc, char **argv) {
     if (argc != 8) {
         printf("usage: scaledset <id> <r> <g> <b> <ww> <cw> <scale>\n");
@@ -570,6 +757,43 @@ static int cmd_dfu(int argc, char **argv) {
     return 0;
 }
 
+// dfurange <first> <last> : DFU every bulb in first..last, one burst per bulb.
+static int cmd_dfurange(int argc, char **argv) {
+    if (argc != 3) {
+        printf("usage: dfurange <first> <last>\n");
+        printf("  one BulbCommand DFU burst (%dx @ %d ms) per bulb, in order, with progress\n",
+               CMD_BURST_COUNT, CMD_BURST_INTERVAL_MS);
+        return 1;
+    }
+    uint8_t first, last;
+    if (!parse_u8(argv[1], &first)) { printf("bad first id\n"); return 1; }
+    if (!parse_u8(argv[2], &last))  { printf("bad last id\n"); return 1; }
+    if (first > last) { printf("first must be <= last\n"); return 1; }
+
+    LOCK();
+    if (s_dfurange_active) {
+        UNLOCK();
+        printf("a dfurange is already running\n");
+        return 1;
+    }
+    s_dfurange_active = true;
+    UNLOCK();
+
+    dfurange_args_t *a = malloc(sizeof(*a));
+    if (!a) { LOCK(); s_dfurange_active = false; UNLOCK(); printf("out of memory\n"); return 1; }
+    a->first = first; a->last = last;
+    int total = last - first + 1;
+    if (xTaskCreate(dfurange_task, "dfurange", 4096, a, 5, NULL) != pdPASS) {
+        free(a);
+        LOCK(); s_dfurange_active = false; UNLOCK();
+        printf("failed to start dfurange task\n");
+        return 1;
+    }
+    printf("dfurange: sending DFU to bulbs %d..%d (%d bulbs, ~%d s)\n", first, last, total,
+           (total * CMD_BURST_COUNT * CMD_BURST_INTERVAL_MS + 999) / 1000);
+    return 0;
+}
+
 // setconfig <id> <key> <u8|u32|f32|str> <value> : issue a SetConfig BulbCommand.
 static int cmd_setconfig(int argc, char **argv) {
     if (argc != 5) {
@@ -642,40 +866,69 @@ static int cmd_seq(int argc, char **argv) {
     return 0;
 }
 
-static int cmd_sweep(int argc, char **argv) {
-    if (argc != 4) {
-        printf("usage: sweep <id> <channels> <duration_ms>\n");
-        printf("  channels: comma list of r,g,b,ww,cw  (e.g. r,g,b)\n");
+// Shared body of `sweep` / `sweeprange`: start a linear sweep of `chan_str`
+// channels over ids first..last with a full cycle every `ms_str` ms.
+static int start_sweep(int first, int last, const char *chan_str, const char *ms_str) {
+    uint8_t mask;
+    if (!parse_channel_mask(chan_str, &mask)) {
+        printf("bad channels '%s' (use r,g,b,ww,cw)\n", chan_str);
         return 1;
     }
-    uint8_t id, mask;
-    if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
-    if (!parse_channel_mask(argv[2], &mask)) {
-        printf("bad channels '%s' (use r,g,b,ww,cw)\n", argv[2]);
-        return 1;
-    }
-    int ms = atoi(argv[3]);
+    int ms = atoi(ms_str);
     if (ms < 100 || ms > 600000) {
         printf("duration out of range (100..600000 ms)\n");
         return 1;
     }
 
     LOCK();
-    // Ensure an entry exists for this bulb so the sweep has somewhere to write;
-    // channels not being swept keep whatever value they already hold.
-    int slot = find_entry(id);
-    if (slot < 0) {
-        for (int i = 0; i < MAX_ENTRIES; i++)
-            if (!s_entries[i].used) { slot = i; break; }
-        if (slot < 0) { UNLOCK(); printf("no free entry slots (max %d)\n", MAX_ENTRIES); return 1; }
-        s_entries[slot] = (entry_t){.used = true, .id = id};
+    // Ensure an entry exists for every swept bulb so the sweep has somewhere
+    // to write; channels not being swept keep whatever value they already hold.
+    if (!ensure_range_entries(first, last)) {
+        int free_slots = MAX_ENTRIES - count_entries_from(0);
+        UNLOCK();
+        printf("not enough free entry slots (%d free, max %d)\n", free_slots, MAX_ENTRIES);
+        return 1;
     }
-    s_sweep = (sweep_t){.active = true, .id = id, .mask = mask,
-                        .period_ms = ms, .start_us = esp_timer_get_time()};
+    s_sweep = (sweep_t){.active = true, .first = (uint8_t)first, .last = (uint8_t)last,
+                        .mask = mask, .period_ms = ms, .start_us = esp_timer_get_time()};
     UNLOCK();
-    printf("sweeping bulb %d channels %s over %d ms (0->255->0, looping)\n",
-           id, argv[2], ms);
+    if (first == last)
+        printf("sweeping bulb %d channels %s over %d ms (0->255->0, looping)\n",
+               first, chan_str, ms);
+    else
+        printf("sweeping bulbs %d..%d (%d) channels %s over %d ms (0->255->0, looping, in lockstep)\n",
+               first, last, last - first + 1, chan_str, ms);
     return 0;
+}
+
+static int cmd_sweep(int argc, char **argv) {
+    if (argc != 4) {
+        printf("usage: sweep <id> <channels> <duration_ms>\n");
+        printf("  channels: comma list of r,g,b,ww,cw  (e.g. r,g,b)\n");
+        return 1;
+    }
+    uint8_t id;
+    if (!parse_u8(argv[1], &id)) { printf("bad id\n"); return 1; }
+    return start_sweep(id, id, argv[2], argv[3]);
+}
+
+// sweeprange <first> <last> <channels> <duration_ms> : one sweep driving every
+// bulb in first..last in lockstep (replaces any active linear sweep).
+static int cmd_sweeprange(int argc, char **argv) {
+    if (argc != 5) {
+        printf("usage: sweeprange <first> <last> <channels> <duration_ms>\n");
+        printf("  channels: comma list of r,g,b,ww,cw  (e.g. r,g,b)\n");
+        return 1;
+    }
+    uint8_t first, last;
+    if (!parse_u8(argv[1], &first)) { printf("bad first id\n"); return 1; }
+    if (!parse_u8(argv[2], &last))  { printf("bad last id\n"); return 1; }
+    if (first > last) { printf("first must be <= last\n"); return 1; }
+    if (last - first + 1 > MAX_ENTRIES) {
+        printf("range covers %d bulbs (max %d)\n", last - first + 1, MAX_ENTRIES);
+        return 1;
+    }
+    return start_sweep(first, last, argv[3], argv[4]);
 }
 
 static int cmd_psweep(int argc, char **argv) {
@@ -734,6 +987,25 @@ static int cmd_chan(int argc, char **argv) {
     return 0;
 }
 
+// rate <mbps> : set the PHY rate used for injected frames (applies immediately).
+static int cmd_rate(int argc, char **argv) {
+    if (argc != 2) {
+        printf("usage: rate <");
+        for (int i = 0; i < N_RATE_OPTS; i++) printf("%s%s", i ? "|" : "", s_rate_opts[i].name);
+        printf(">  (Mbps)\n");
+        return 1;
+    }
+    int idx = -1;
+    for (int i = 0; i < N_RATE_OPTS; i++)
+        if (!strcmp(argv[1], s_rate_opts[i].name)) { idx = i; break; }
+    if (idx < 0) { printf("unknown rate '%s'\n", argv[1]); return 1; }
+    esp_err_t e = esp_wifi_config_80211_tx_rate(WIFI_IF_STA, s_rate_opts[idx].rate);
+    if (e != ESP_OK) { printf("failed to set rate: %s\n", esp_err_to_name(e)); return 1; }
+    LOCK(); s_rate_idx = idx; UNLOCK();
+    printf("tx rate = %s Mbps\n", s_rate_opts[idx].name);
+    return 0;
+}
+
 static int cmd_interval(int argc, char **argv) {
     if (argc != 2) { printf("usage: interval <ms>\n"); return 1; }
     int ms = atoi(argv[1]);
@@ -760,12 +1032,16 @@ static int cmd_stop(int argc, char **argv) {
 static int cmd_show(int argc, char **argv) {
     (void)argc; (void)argv;
     LOCK();
-    printf("state: %s  channel %d  interval %d ms  next seq %u\n",
-           s_enabled ? "ON" : "OFF", s_channel, s_interval_ms, (unsigned)s_seq);
+    printf("state: %s  channel %d  rate %s Mbps  interval %d ms  next seq %u\n",
+           s_enabled ? "ON" : "OFF", s_channel, s_rate_opts[s_rate_idx].name,
+           s_interval_ms, (unsigned)s_seq);
     printf("base MAC (frame src): %02x:%02x:%02x:%02x:%02x:%02x\n",
            s_base_mac[0], s_base_mac[1], s_base_mac[2], s_base_mac[3], s_base_mac[4], s_base_mac[5]);
+    if (s_dfurange_active) printf("dfurange: in progress\n");
     if (s_sweep.active) {
-        printf("sweep: bulb %d  channels%s%s%s%s%s  period %d ms\n", s_sweep.id,
+        if (s_sweep.first == s_sweep.last) printf("sweep: bulb %d ", s_sweep.first);
+        else printf("sweep: bulbs %d..%d ", s_sweep.first, s_sweep.last);
+        printf(" channels%s%s%s%s%s  period %d ms\n",
                (s_sweep.mask & CH_R)  ? " r"  : "", (s_sweep.mask & CH_G)  ? " g"  : "",
                (s_sweep.mask & CH_B)  ? " b"  : "", (s_sweep.mask & CH_WW) ? " ww" : "",
                (s_sweep.mask & CH_CW) ? " cw" : "", s_sweep.period_ms);
@@ -789,6 +1065,8 @@ static int cmd_show(int argc, char **argv) {
         count++;
     }
     if (!count) printf("  (no entries)\n");
+    else printf("  %d entries in %d packet(s)/tick (%d per packet)\n", count,
+                (count + ENTRIES_PER_PACKET - 1) / ENTRIES_PER_PACKET, ENTRIES_PER_PACKET);
     UNLOCK();
     return 0;
 }
@@ -806,8 +1084,9 @@ static int cmd_bench(int argc, char **argv) {
     LOCK();
     bool was_enabled = s_enabled;
     s_enabled = false;                 // stop the periodic broadcaster competing
-    static uint8_t frame[128];
-    int len = build_beacon(frame);     // benchmark the current entry table
+    static uint8_t frame[SHARD_FRAME_SIZE];
+    int pos = 0;
+    int len = build_beacon_shard(frame, &pos);  // benchmark the first shard of the table
     UNLOCK();
     vTaskDelay(pdMS_TO_TICKS(50));      // let an in-flight broadcast finish
 
@@ -847,16 +1126,20 @@ static void register_commands(void) {
     // that add fields (hint, argtable, func_w_context, ...) to esp_console_cmd_t.
     const esp_console_cmd_t cmds[] = {
         {.command = "set",      .help = "set <id> <r> <g> <b> <ww> <cw> : add/update a bulb entry", .func = &cmd_set},
+        {.command = "setrange", .help = "setrange <first> <last> <r> <g> <b> <ww> <cw> : set every id in first..last to one color", .func = &cmd_setrange},
         {.command = "scaledset",.help = "scaledset <id> <r> <g> <b> <ww> <cw> <scale> : PreciseLightUpdate, channels scaled by scale%", .func = &cmd_scaledset},
         {.command = "clr",      .help = "clr <id> : remove one bulb entry", .func = &cmd_clr},
         {.command = "clrall",   .help = "remove all bulb entries", .func = &cmd_clrall},
         {.command = "dfu",      .help = "dfu <id> [new|legacy] : request DFU (new=BulbCommand, legacy=0x01)", .func = &cmd_dfu},
+        {.command = "dfurange", .help = "dfurange <first> <last> : DFU every id in first..last, one burst per bulb, with progress", .func = &cmd_dfurange},
         {.command = "setconfig",.help = "setconfig <id> <key> <u8|u32|f32|str> <value> : SetConfig BulbCommand", .func = &cmd_setconfig},
         {.command = "seq",      .help = "seq [value] : show or re-seed the BulbCommand sequence counter", .func = &cmd_seq},
         {.command = "sweep",    .help = "sweep <id> <channels> <duration_ms> : linear 0->255->0 loop (channels = r,g,b,ww,cw)", .func = &cmd_sweep},
+        {.command = "sweeprange",.help = "sweeprange <first> <last> <channels> <duration_ms> : linear sweep of every id in first..last in lockstep", .func = &cmd_sweeprange},
         {.command = "psweep",   .help = "psweep <id> <channels> <duration_ms> <min> <max> : precise float sweep between min%..max%", .func = &cmd_psweep},
         {.command = "stopsweep",.help = "stop the active sweep(s)", .func = &cmd_stopsweep},
         {.command = "chan",     .help = "chan <1..13> : set broadcast channel", .func = &cmd_chan},
+        {.command = "rate",     .help = "rate <mbps> : set PHY rate for injected frames (1|2|5.5|11|6|9|12|18|24|36|48|54)", .func = &cmd_rate},
         {.command = "interval", .help = "interval <ms> : set beacon interval", .func = &cmd_interval},
         {.command = "start",    .help = "resume broadcasting", .func = &cmd_start},
         {.command = "stop",     .help = "pause broadcasting", .func = &cmd_stop},
@@ -883,6 +1166,8 @@ static void wifi_init_tx(void) {
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_channel(s_channel, WIFI_SECOND_CHAN_NONE));
     ESP_ERROR_CHECK(esp_wifi_get_mac(WIFI_IF_STA, s_base_mac));
+    // Inject at 11 Mbps rather than the 1 Mbps default (see s_rate_opts).
+    ESP_ERROR_CHECK(esp_wifi_config_80211_tx_rate(WIFI_IF_STA, s_rate_opts[s_rate_idx].rate));
     // Never connect: we only inject frames.
 }
 
@@ -914,7 +1199,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_console_register_help_command());
     register_commands();
 
-    ESP_LOGI(TAG, "RC light base station ready. Type 'help'. Broadcasting on channel %d.",
-             s_channel);
+    ESP_LOGI(TAG, "RC light base station ready. Type 'help'. Broadcasting on channel %d at %s Mbps.",
+             s_channel, s_rate_opts[s_rate_idx].name);
     ESP_ERROR_CHECK(esp_console_start_repl(repl));
 }

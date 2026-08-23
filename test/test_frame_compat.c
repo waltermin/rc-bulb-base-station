@@ -29,7 +29,8 @@
 #define CTRL_FLAG_DFU 0x01
 #define CMD_ENTER_DFU 0x00
 #define CMD_SET_CONFIG 0x01
-#define MAX_ENTRIES 11
+#define MAX_ENTRIES 64          // base-station table size
+#define ENTRIES_PER_PACKET 11   // bulb-side per-packet limit (PROTO_MAX_ENTRIES)
 #define ENTRY_SIZE 6
 
 typedef struct { uint8_t id, r, g, b, ww, cw; } entry_t;
@@ -59,7 +60,9 @@ static int write_ie(uint8_t *p, int n, const uint8_t *body, int blen) {
     return n;
 }
 
-// 0x03 LightUpdateV2 entry table (the base station's build_beacon).
+// 0x03 LightUpdateV2 entry table — one shard of <= ENTRIES_PER_PACKET entries
+// (the base station's build_beacon_shard). n_entries may exceed that only in
+// the negative test below.
 static int build_v2(uint8_t *p, const uint8_t base_mac[6],
                     const entry_t *entries, int n_entries) {
     int n = write_header(p, base_mac);
@@ -140,17 +143,58 @@ int main(void) {
         CHECK(!r.has_entry);
     }
 
-    // Full 11-entry table still fits and decodes.
+    // A full 11-entry packet still fits and decodes.
     {
-        entry_t e[MAX_ENTRIES];
-        for (int i = 0; i < MAX_ENTRIES; i++)
+        entry_t e[ENTRIES_PER_PACKET];
+        for (int i = 0; i < ENTRIES_PER_PACKET; i++)
             e[i] = (entry_t){(uint8_t)(i + 1), (uint8_t)i, 0, 0, 0, 0};
-        int len = build_v2(buf, mac, e, MAX_ENTRIES);
+        int len = build_v2(buf, mac, e, ENTRIES_PER_PACKET);
         bulb_parse_result_t r = protocol_parse_beacon(buf, len, 11);
-        printf("v2: full 11-entry table, bulb 11:\n");
+        printf("v2: full 11-entry packet, bulb 11:\n");
         CHECK(r.valid);
         CHECK(r.has_entry);
         CHECK(FEQ(r.r, 10 / 255.0f));
+    }
+
+    // A 12-entry packet is rejected by the bulb — which is why the base station
+    // shards its table across packets instead of growing the packet.
+    {
+        entry_t e[12];
+        for (int i = 0; i < 12; i++) e[i] = (entry_t){(uint8_t)(i + 1), 1, 2, 3, 4, 5};
+        int len = build_v2(buf, mac, e, 12);
+        bulb_parse_result_t r = protocol_parse_beacon(buf, len, 12);
+        printf("v2: 12-entry packet rejected by bulb:\n");
+        CHECK(!r.valid || !r.has_entry);
+    }
+
+    // Full 64-entry table (e.g. `setrange 1 64 ...`) sharded into ceil(64/11)=6
+    // packets of <=11 entries: every bulb 1..64 finds its entry in exactly one
+    // shard, including the last (partial, 9-entry) shard.
+    {
+        entry_t table[MAX_ENTRIES];
+        for (int i = 0; i < MAX_ENTRIES; i++)
+            table[i] = (entry_t){(uint8_t)(i + 1), (uint8_t)(i + 1), 0, 0, 0, 0};
+        printf("v2: 64-entry table sharded across packets:\n");
+        int shards = 0;
+        int hits[MAX_ENTRIES + 1] = {0};
+        for (int pos = 0; pos < MAX_ENTRIES; pos += ENTRIES_PER_PACKET) {
+            int n = MAX_ENTRIES - pos;
+            if (n > ENTRIES_PER_PACKET) n = ENTRIES_PER_PACKET;
+            int len = build_v2(buf, mac, table + pos, n);
+            shards++;
+            for (int id = 1; id <= MAX_ENTRIES; id++) {
+                bulb_parse_result_t r = protocol_parse_beacon(buf, len, (uint8_t)id);
+                CHECK(r.valid);
+                if (r.has_entry) {
+                    hits[id]++;
+                    CHECK(FEQ(r.r, id / 255.0f));
+                }
+            }
+        }
+        CHECK(shards == 6);
+        int all_once = 1;
+        for (int id = 1; id <= MAX_ENTRIES; id++) if (hits[id] != 1) all_once = 0;
+        CHECK(all_once);
     }
 
     // Empty table (base broadcasting nothing) is still a valid frame.
